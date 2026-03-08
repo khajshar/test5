@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# openclaud [provider/model] [claude args...]
+# Example: ./openclaud gemini/gemini-2.5-flash
+#          ./openclaud mistral/mistral-small-latest
+#          ./openclaud groq/llama-3.1-8b-instant
+set -e
+
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PORT="${OPENCLAUD_PORT:-18080}"
+
+# Source providers.env to expose keys (e.g. GITHUB_PERSONAL_ACCESS_TOKEN) to Claude
+if [ -f "$REPO/providers.env" ]; then
+  # Sourcing and exporting everything
+  # We use a subshell/temp approach to handle possible comments and spaces safely
+  set -a
+  source "$REPO/providers.env"
+  set +a
+fi
+
+# Parse flags
+DETERMINISTIC=0
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    --deterministic) DETERMINISTIC=1; shift ;;
+    *) break ;;
+  esac
+done
+
+# Parse provider/model from remaining args
+FIRST="${1:-}"
+if [[ "$FIRST" == */* ]]; then
+  PROVIDER="${FIRST%%/*}"
+  MODEL="$FIRST"
+  shift
+elif [[ -n "$FIRST" && "$FIRST" != -* ]]; then
+  PROVIDER="$FIRST"
+  MODEL=""
+  shift
+elif [[ $# -eq 0 ]]; then
+  # No arguments at all (after --deterministic parsing).
+  PROVIDER="vkazure"
+  MODEL=""
+else
+  # Arguments are present, but they are flags for claude.
+  # Do not set a provider and let claude handle them.
+  PROVIDER=""
+  MODEL=""
+fi
+
+export OPENCLAUD_DETERMINISTIC="$DETERMINISTIC"
+
+# Kill any existing proxy on this port
+pkill -f "claude_proxy.py.*$PORT" 2>/dev/null || true
+sleep 0.3
+
+# Start proxy in background
+# Use -port for the proxy script and preserve keys for it
+python3 "$REPO/scripts/claude_proxy.py" --port "$PORT" > /tmp/openclaud_proxy.log 2>&1 &
+PROXY_PID=$!
+
+# Wait for port to be ready (max 5s)
+for i in {1..10}; do
+  nc -z 127.0.0.1 "$PORT" 2>/dev/null && break || sleep 0.5
+done
+
+echo "[openclaud] provider=$PROVIDER model=${MODEL:-auto} proxy=http://127.0.0.1:$PORT pid=$PROXY_PID"
+
+# Launch claude — on exit, kill proxy
+trap "kill $PROXY_PID 2>/dev/null" EXIT
+
+# RESOLVE AUTH CONFLICT:
+# Claude Code warns/fails if both API key and token helper are set.
+# Since .claude/settings.json defines a helper, we MUST NOT set ANTHROPIC_API_KEY.
+# We pass routing info via standard environment variables that our proxy supports.
+  ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" \
+  ANTHROPIC_API_KEY="openclaud-$MODEL" \
+  claude "$@"
